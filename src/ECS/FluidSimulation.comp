@@ -1,0 +1,205 @@
+#version 430 core
+
+// Definition group size threads (Work Group)
+// 64 or 128 - standard
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Structure particle
+struct Particle {
+    vec4 position;      // vec4 for GPU memory alignning (std430 rule)
+    vec4 velocity;
+    vec2 properties;    // x: density, y: pressure
+};
+
+// SBBOs: Massive storage buffers in the GPU
+layout(std430, binding = 0) buffer ParticleBuffer {
+    Particle particles[];
+};
+
+layout(std430, binding = 1) buffer GridCountBuffer {
+    uint gridCounts[];
+};
+
+layout(std430, binding = 2) buffer GridIndicesBuffer {
+    uint gridIndices[];
+};
+
+// Physics constants
+uniform float deltaTime;
+uniform int particleCount;
+uniform float simulationTime;
+uniform int pass;
+
+// Interaction region
+uniform vec3 interactionPos;
+uniform float interactionRadius;
+uniform float interactionStrength;
+uniform vec3 gravityDirection;
+
+const float SMOOTHING_LENGTH = 0.18f;
+const float PARTICLE_MASS = 1.f;
+const float REST_DENSITY = 250.f;
+const float GAS_CONSTANT = 250.f;
+const float VISCOSITY = 0.3f;
+const float GRAVITY = -9.81f;
+const float PI = 3.14159265359f;
+
+// Kernels precalcs
+const float H2 = SMOOTHING_LENGTH * SMOOTHING_LENGTH;
+const float H_POW_9 = pow(SMOOTHING_LENGTH, 9.f);       // Maybe we have to optimizate it
+const float H_POW_6 = pow(SMOOTHING_LENGTH, 6.f);
+const float POLY6_FACTOR = 315.f / (64.f * PI * H_POW_9);
+const float SPIKY_GRAD_FACTOR = -45.f / (PI * H_POW_6);
+const float VISC_LAP_FACTOR = 45.f / (PI * H_POW_6);
+const float SELF_DENSITY = PARTICLE_MASS * POLY6_FACTOR * H_POW_6;
+
+const ivec3 GRID_RES = ivec3(28,28,28);
+const vec3 BOX_MIN = vec3(-2.5f, 0.f, -2.5f);
+
+ivec3 GetCellCoords(vec3 pos) {
+    ivec3 cellCoords = ivec3(floor((pos - BOX_MIN) / SMOOTHING_LENGTH));
+    return clamp(cellCoords, ivec3(0), GRID_RES - ivec3(1));
+}
+
+int GetCellLinearIndex(ivec3 coords) {
+    return coords.x + coords.y * GRID_RES.x + coords.z * (GRID_RES.x * GRID_RES.y);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= particleCount) return;
+
+    if (pass == 0) {
+        vec3 posI = particles[i].position.xyz;
+        ivec3 cellCoordsI = GetCellCoords(posI);
+        float sumDensity = SELF_DENSITY;
+
+        for (int z = -1; z <= 1; ++z) {
+            for (int y = -1; y <= 1; ++y) {
+                for (int x = -1; x <= 1; ++x) {
+                    ivec3 neighborCoords = cellCoordsI + ivec3(x, y, z);
+
+                    if (neighborCoords.x < 0 || neighborCoords.x >= GRID_RES.x ||
+                        neighborCoords.y < 0 || neighborCoords.y >= GRID_RES.y ||
+                        neighborCoords.z < 0 || neighborCoords.z >= GRID_RES.z)
+                            continue;
+
+                    int cellIdx = neighborCoords.x + neighborCoords.y * GRID_RES.x + neighborCoords.z * (GRID_RES.x * GRID_RES.y);
+                    uint count = gridCounts[cellIdx];
+                    if (count == 0) continue;
+
+                    uint maxParticlesInCell = min(count, 64);
+
+                    for (uint p = 0; p < maxParticlesInCell; ++p) {
+                        uint j = gridIndices[(cellIdx * 64) + p];
+                        if (i == j) continue;
+
+                        vec3 diff = posI - particles[j].position.xyz;
+                        float r2 = dot(diff, diff);
+                        if (r2 < H2) {
+                            float term = H2 - r2;
+                            sumDensity += PARTICLE_MASS * POLY6_FACTOR * (term * term * term);
+                        }
+                    }
+                }
+            }
+        }
+        particles[i].properties.x = sumDensity;
+
+        float pressure = GAS_CONSTANT * (sumDensity - REST_DENSITY);
+        particles[i].properties.y = (pressure < 0.f) ? 0.f : pressure;
+    }
+    else if (pass == 1) {
+        vec3 posI = particles[i].position.xyz;
+        vec3 velI = particles[i].velocity.xyz;
+        ivec3 cellCoordsI = GetCellCoords(posI);
+
+        float densityI = max(particles[i].properties.x, 0.2f);
+        float pressureI = particles[i].properties.y;
+
+        vec3 forcePressure = vec3(0.f);
+        vec3 forceViscosity = vec3(0.f);
+
+        float noiseX = sin(posI.y * 2.f + simulationTime) * 0.12f;
+        float noiseZ = cos(posI.x * 2.f + simulationTime) * 0.12f;
+        vec3 forceStirring = vec3(noiseX * PARTICLE_MASS, 0.f, noiseZ * PARTICLE_MASS);
+
+        vec3 forceExternal = vec3(0.f);
+        if (interactionStrength > 0.f) {
+            vec3 dirToClick = posI - interactionPos;
+            float dist2 = dot(dirToClick, dirToClick);
+            float radius2 = interactionRadius * interactionRadius;
+
+            if (dist2 < radius2 && dist2 > 0.0001f) {
+                float dist = sqrt(dist2);
+                vec3 dirNorm = dirToClick / dist;
+                float t = 1.f - (dist / interactionRadius);
+                forceExternal = dirNorm * interactionStrength * t * PARTICLE_MASS * 5000.f;
+            }
+            
+        }
+
+        for (int z = -1; z <= 1; ++z) {
+            for (int y = -1; y <= 1; ++y) {
+                for (int x = -1; x <= 1; ++x) {
+                    ivec3 neighborCoords = cellCoordsI + ivec3(x, y, z);
+
+                    if (neighborCoords.x < 0 || neighborCoords.x >= GRID_RES.x ||
+                        neighborCoords.y < 0 || neighborCoords.y >= GRID_RES.y ||
+                        neighborCoords.z < 0 || neighborCoords.z >= GRID_RES.z)
+                            continue;
+
+                    int cellIdx = neighborCoords.x + neighborCoords.y * GRID_RES.x + neighborCoords.z * (GRID_RES.x * GRID_RES.y);
+                    uint count = gridCounts[cellIdx];
+                    if (count == 0) continue;
+
+                    uint maxParticlesInCell = min(count, 64);
+
+                    for (uint p = 0; p < maxParticlesInCell; ++p) {
+                        uint j = gridIndices[(cellIdx * 64) + p];
+                        if (i == j) continue;
+
+                        vec3 diff = posI - particles[j].position.xyz;
+                        float r2 = dot(diff, diff);
+
+                        if (r2 > 0.f && r2 < H2) {
+                            float r = sqrt(r2);
+                            float densityJ = max(particles[j].properties.x, 0.2f);
+                            float pressureJ = particles[j].properties.y;
+
+                            vec3 dir = diff / r;
+                            float pTerm = SMOOTHING_LENGTH - r;
+
+                            // Spiky Gradient
+                            float gradW = SPIKY_GRAD_FACTOR * (pTerm * pTerm);
+                            forcePressure += -PARTICLE_MASS * ((pressureI + pressureJ) / (2.f * densityJ)) * gradW * dir;
+
+                            // Laplacian Viscosity
+                            float lapW = VISC_LAP_FACTOR * pTerm;
+                            forceViscosity += VISCOSITY * PARTICLE_MASS * ((particles[j].velocity.xyz - velI) / densityJ) * lapW;
+                        }
+                    }
+                }
+            }
+        }
+
+        float densityScale = max(densityI, REST_DENSITY * 0.5f);
+        vec3 acceleration = (forcePressure + forceViscosity + forceStirring + forceExternal) / densityScale + gravityDirection;
+
+        vec3 newVel = velI + acceleration * deltaTime;
+        vec3 newPos = posI + newVel * deltaTime;
+
+        // Bounding Box (-2.5 to 2.5)
+        float DAMPING = -0.25f, WALL_FRICTION = 0.85f;
+
+        if (newPos.x < -2.5f) { newPos.x = -2.5f; newVel.x *= DAMPING; newVel.yz *= WALL_FRICTION;}
+        if (newPos.x > 2.5f) { newPos.x = 2.5f; newVel.x *= DAMPING; newVel.yz *= WALL_FRICTION;}
+        if (newPos.y < 0.f) { newPos.y = 0.f; newVel.y *= DAMPING; newVel.xz *= 0.92f;  }
+        if (newPos.y > 5.f) { newPos.y = 5.f; newVel.y *= DAMPING;}
+        if (newPos.z < -2.5f) { newPos.z = -2.5f; newVel.z *= DAMPING; newVel.xy *= WALL_FRICTION;}
+        if (newPos.z > 2.5f) { newPos.z = 2.5f; newVel.z *= DAMPING; newVel.xy *= WALL_FRICTION;}
+
+        particles[i].position.xyz = newPos;
+        particles[i].velocity.xyz = newVel;
+    }
+}
